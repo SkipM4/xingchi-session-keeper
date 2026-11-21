@@ -42,13 +42,17 @@ function mkCtx(providerId, options, protocol = "chat") {
 }
 
 describe("选项解析", () => {
-  test("readOptions 默认值", () => {
+  test("readOptions 默认值（含未配置时默认启用 xingchi）", () => {
     const o = readOptions(undefined)
     assert.equal(o.maxRequests, 80)
     assert.equal(o.mark, "both")
     assert.equal(o.coolDownMs, 60000)
     assert.ok(o.matchCodes["session_request_limit_exceeded"])
-    assert.deepEqual(o.providers, {})
+    assert.ok(o.defaulted) // 没保存过选项
+    assert.deepEqual(o.providers, { xingchi: true }) // 默认启用 xingchi
+    const saved = readOptions({ providers: { my: true } })
+    assert.equal(saved.defaulted, false) // 显式配置优先
+    assert.deepEqual(saved.providers, { my: true })
   })
 
   test("providerConfig 按供应商 id 匹配（支持前缀与 *）", () => {
@@ -184,9 +188,17 @@ describe("钩子端到端", () => {
   test("未配置的供应商：原样放行", () => {
     reset()
     const body = { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }
-    const out = onProvider(body, mkCtx("other", {}))
+    const out = onProvider(body, mkCtx("other", { providers: {} }))
     assert.equal(out, undefined)
     assert.equal(body.messages.length, 1) // 未被修改
+  })
+
+  test("空选项（未保存过）：默认启用 xingchi", () => {
+    reset()
+    const body = { model: "m", messages: [{ role: "user", content: "hi" }] }
+    const out = onProvider(body, mkCtx("xingchi", {}))
+    assert.ok(out) // 无需任何配置就对 xingchi 生效
+    assert.ok(out.messages[0].content.startsWith("[magpie-session:"))
   })
 
   test("启用后注入标记，同对话计数，主动轮换", () => {
@@ -301,10 +313,32 @@ describe("钩子端到端", () => {
     assert.ok(String(out.input[0].content[0].text).startsWith("[magpie-session:"))
   })
 
+  test("协议无关剥离：chat 协议带 prompt_cache_key 也删除", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const body = { model: "m", messages: [{ role: "user", content: "hi" }], prompt_cache_key: "old1" }
+    const out = onProvider(body, mkCtx("xingchi", opts, "chat"))
+    assert.ok(out)
+    assert.equal(out.prompt_cache_key, undefined) // 不依赖 protocol 值
+  })
+
+  test("session_id 字段也剥离，可用 stripSessionId: false 关闭", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const body = { model: "m", messages: [{ role: "user", content: "hi" }], session_id: "sess-old1" }
+    const out = onProvider(body, mkCtx("xingchi", opts, "chat"))
+    assert.equal(out.session_id, undefined)
+    // 关闭后保留
+    const opts2 = { providers: { xingchi: { stripSessionId: false } } }
+    const body2 = { model: "m", messages: [{ role: "user", content: "hi2" }], session_id: "sess-keep" }
+    const out2 = onProvider(body2, mkCtx("xingchi", opts2, "chat"))
+    assert.equal(out2.session_id, "sess-keep")
+  })
+
   test("Responses API：未启用供应商时 prompt_cache_key 原样保留", () => {
     reset()
     const body = { model: "m", input: "hi", prompt_cache_key: "keep-me" }
-    const out = onProvider(body, mkCtx("other", {}, "responses"))
+    const out = onProvider(body, mkCtx("other", { providers: {} }, "responses"))
     assert.equal(out, undefined)
     assert.equal(body.prompt_cache_key, "keep-me") // 未启用：请求体未被修改
   })

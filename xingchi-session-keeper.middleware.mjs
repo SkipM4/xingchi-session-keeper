@@ -90,7 +90,12 @@ function readOptions(raw) {
   out.matchCodes = codes
   out.matchText =
     typeof o.matchText === "string" && o.matchText.trim() !== "" ? o.matchText + "|" + DEFAULT_TEXT : DEFAULT_TEXT
-  out.providers = o.providers && typeof o.providers === "object" && !Array.isArray(o.providers) ? o.providers : {}
+  // package.json 里的 magpie.options 只是编辑框的起点：用户没保存过选项时
+  // ctx.options 是空对象，这里会什么都匹配不到。因此 providers 缺省时
+  // 默认启用 xingchi（与包名一致），显式配置永远优先。
+  out.providers = o.providers && typeof o.providers === "object" && !Array.isArray(o.providers) ? o.providers : null
+  out.defaulted = out.providers === null
+  if (out.defaulted) out.providers = { xingchi: true }
   return out
 }
 
@@ -112,6 +117,7 @@ function providerConfig(opts, providerId) {
     coolDownMs: toInt(per.coolDownMs, opts.coolDownMs, 1000, 3600000),
     matchCodes: opts.matchCodes,
     matchText: opts.matchText,
+    stripSessionId: per.stripSessionId !== undefined ? per.stripSessionId : opts.stripSessionId !== false,
   }
 }
 
@@ -463,18 +469,28 @@ export function onProvider(body, ctx) {
 
     const kind = ctx.protocol || "chat"
 
-    // Responses API（Codex）：删除请求体里的 prompt_cache_key——
-    // Codex 把自己的会话 id 放在这里。不删掉的话，已耗尽的旧会话标识
-    // 会继续传到上游，即使换了新会话标记也可能被归回旧会话。
-    // 只对启用的供应商生效；上游地址、认证信息、tools 等业务字段一概不动。
-    let strippedCacheKey = false
-    if (kind === "responses" && body.prompt_cache_key !== undefined) {
+    // 删除客户端带来的旧会话标识（Codex：prompt_cache_key；OpenAI 兼容：session_id）。
+    // 不依赖 ctx.protocol 判断：protocol 值与预期不符时也要可靠剥离，
+    // 只认「字段存在于请求体」。只删列出的字段，其余一概不动。
+    let stripped = []
+    if (body.prompt_cache_key !== undefined) {
       delete body.prompt_cache_key
-      strippedCacheKey = true
+      stripped.push("prompt_cache_key")
+    }
+    if (cfg.stripSessionId !== false && typeof body.session_id === "string") {
+      delete body.session_id
+      stripped.push("session_id")
+    }
+    if (stripped.length > 0) {
       console.log(
-        "session-keeper: " + String(ctx.provider.id) + " 已删除 Responses 请求的 prompt_cache_key（切断旧会话标识）",
+        "session-keeper: " +
+          String(ctx.provider.id) +
+          " 已删除请求体中的会话标识字段（" +
+          stripped.join(", ") +
+          "），切断旧会话",
       )
     }
+    const strippedCacheKey = stripped.length > 0
 
     // 轮换与标记都关着时：剥完 cache key 就收工
     if (cfg.mark === "none" && cfg.maxRequests === 0) {
