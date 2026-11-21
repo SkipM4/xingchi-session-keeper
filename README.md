@@ -5,15 +5,21 @@
 
 它是纯网关中间件——挂在你**已有的**供应商和登录上（内置订阅、API key、别的插件提供的供应商都行），自己不做任何登录。
 
-## 会话标识剥离（Codex / Responses 及兼容客户端）
+## 会话标识字段改写（Codex / Responses 及兼容客户端）
 
-发往启用供应商的请求会**删除请求体里的 `prompt_cache_key` 与 `session_id` 字段**——Codex 把自己的会话 id 放在这里，不删掉的话已耗尽的旧会话标识会继续传到上游，换了新会话标记也可能被归回旧会话。剥离**不依赖协议判断**（只认字段是否存在），模型、`tools`、`instructions`、`store`、认证信息等一概不动；未启用的供应商请求原样放行。即使把 `mark` 设为 `none`、`maxRequests` 设为 0（关闭轮换），剥离依然生效——可以单独当「旧会话标识切断器」用。`session_id` 剥离可按供应商用 `{"stripSessionId": false}` 关闭。
+对发往启用供应商的请求体里的 `prompt_cache_key` / `session_id` 字段，提供三种模式（选项 `sessionFields`，默认 `replace`）：
 
-## 0.2.0 变更
+- **`replace`（默认）**：把轮换的会话 id **写入**这两个字段（原字段存在才写）。Codex 带来的旧会话标识被替换，中转站按 body 归会话时完全可控——轮换时字段值同步变化；
+- **`strip`**：删除这两个字段（v0.2.0 行为）；
+- **`off`**：不动。
 
-- **无需配置即生效**：未保存过插件选项时默认启用 `xingchi` 供应商（`package.json` 的建议选项只是编辑框起点，保存前运行时拿不到——之前会导致剥离不执行）；显式配置 `providers` 后以配置为准；
-- **剥离不依赖协议**：之前要求 `ctx.protocol === "responses"` 才删 `prompt_cache_key`，protocol 值不符时会静默跳过；现在只认字段存在；
-- **`session_id` 字段也剥离**（可用 `stripSessionId: false` 按供应商关闭）。
+不依赖协议判断（只认字段存在），模型、`tools`、`instructions`、`store`、认证信息等一概不动；未启用的供应商请求原样放行。即使把 `mark` 设为 `none`、`maxRequests` 设为 0（关闭标记与轮换），字段改写依然生效。
+
+## 版本变更
+
+**0.3.0**：`sessionFields` 默认从删除改为 `replace`——把轮换会话 id 写进 `prompt_cache_key` / `session_id`（实测仅删除字段不够：magpie 详情里「会话 ID」来自 Codex 的请求头，仅删 body 字段时上游仍按旧会话归因；改写后 body 值优先可控）。
+
+**0.2.0**：未保存选项时默认启用 `xingchi`（`package.json` 建议选项在保存前运行时拿不到，之前导致不生效）；剥离不再依赖 `ctx.protocol`；`session_id` 字段纳入处理。
 
 ## 原理
 

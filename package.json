@@ -1,6 +1,6 @@
 {
   "name": "xingchi-session-keeper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "magpie gateway middleware: automatically rotate sessions when XingChi (or any provider) hits its per-session request limit",
   "type": "module",
   "keywords": ["magpie", "middleware", "xingchi", "session", "relay"],

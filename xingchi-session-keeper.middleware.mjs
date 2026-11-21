@@ -111,12 +111,18 @@ function providerConfig(opts, providerId) {
   }
   if (hit === undefined || hit === null || hit === false) return null
   const per = hit && typeof hit === "object" ? hit : {}
+  const sf = ["replace", "strip", "off"].indexOf(per.sessionFields) >= 0
+    ? per.sessionFields
+    : ["replace", "strip", "off"].indexOf(opts.sessionFields) >= 0
+      ? opts.sessionFields
+      : "replace"
   return {
     maxRequests: toInt(per.maxRequests, opts.maxRequests, 0, 1000000),
     mark: ["none", "system", "first-user", "both"].indexOf(per.mark) >= 0 ? per.mark : opts.mark,
     coolDownMs: toInt(per.coolDownMs, opts.coolDownMs, 1000, 3600000),
     matchCodes: opts.matchCodes,
     matchText: opts.matchText,
+    sessionFields: sf,
     stripSessionId: per.stripSessionId !== undefined ? per.stripSessionId : opts.stripSessionId !== false,
   }
 }
@@ -468,35 +474,6 @@ export function onProvider(body, ctx) {
     if (!cfg) return undefined // 该供应商未启用：原样发送（头与请求体都不动）
 
     const kind = ctx.protocol || "chat"
-
-    // 删除客户端带来的旧会话标识（Codex：prompt_cache_key；OpenAI 兼容：session_id）。
-    // 不依赖 ctx.protocol 判断：protocol 值与预期不符时也要可靠剥离，
-    // 只认「字段存在于请求体」。只删列出的字段，其余一概不动。
-    let stripped = []
-    if (body.prompt_cache_key !== undefined) {
-      delete body.prompt_cache_key
-      stripped.push("prompt_cache_key")
-    }
-    if (cfg.stripSessionId !== false && typeof body.session_id === "string") {
-      delete body.session_id
-      stripped.push("session_id")
-    }
-    if (stripped.length > 0) {
-      console.log(
-        "session-keeper: " +
-          String(ctx.provider.id) +
-          " 已删除请求体中的会话标识字段（" +
-          stripped.join(", ") +
-          "），切断旧会话",
-      )
-    }
-    const strippedCacheKey = stripped.length > 0
-
-    // 轮换与标记都关着时：剥完 cache key 就收工
-    if (cfg.mark === "none" && cfg.maxRequests === 0) {
-      return strippedCacheKey ? body : undefined
-    }
-
     const key = convKeyOf(body, kind, String(ctx.provider.id || ""))
 
     pruneState()
@@ -536,6 +513,39 @@ export function onProvider(body, ctx) {
     const didSystem = st.mark === "system" || st.mark === "both" ? markSystem(body, kind, marker) : false
     const didUser = st.mark === "first-user" || st.mark === "both" ? markFirstUser(body, kind, marker) : false
     if (kind === "anthropic") setMetadataSession(body, st.sid)
+
+    // 会话字段改写（默认 replace）：
+    //   replace — 把轮换的会话 id 写进 prompt_cache_key / session_id（原字段存在才写）。
+    //             Codex 的原值（请求头带来的会话标识）会被我们轮换的值替换，
+    //             中转站按 body 归会话时完全可控；只读头的站也至少不再收到旧值。
+    //   strip   — 删除这两个字段（v0.2.0 行为）。
+    //   off     — 不动。
+    let touched = []
+    if (cfg.sessionFields !== "off") {
+      if (body.prompt_cache_key !== undefined) {
+        if (cfg.sessionFields === "strip") delete body.prompt_cache_key
+        else body.prompt_cache_key = st.sid
+        touched.push("prompt_cache_key")
+      }
+      if (cfg.sessionFields !== "strip" || cfg.stripSessionId !== false) {
+        if (body.session_id !== undefined) {
+          if (cfg.sessionFields === "strip") delete body.session_id
+          else body.session_id = st.sid
+          touched.push("session_id")
+        }
+      }
+    }
+    if (touched.length > 0) {
+      console.log(
+        "session-keeper: " +
+          String(ctx.provider.id) +
+          " 会话标识字段已改写为轮换值（" +
+          touched.join(", ") +
+          " → " +
+          st.sid.slice(0, 8) +
+          "…）",
+      )
+    }
 
     if (rotated || didSystem || didUser) {
       console.log(

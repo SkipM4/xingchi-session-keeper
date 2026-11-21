@@ -287,7 +287,7 @@ describe("钩子端到端", () => {
     assert.equal(sid, "oldsid1") // 恢复而不是新开
   })
 
-  test("Responses API：删除 prompt_cache_key，其余字段不动", () => {
+  test("Responses API：默认 replace——prompt_cache_key 换成轮换值，其余字段不动", () => {
     reset()
     const opts = { providers: { xingchi: true } }
     // Codex 发来的 Responses 请求体，带着它自己的会话 id
@@ -302,37 +302,70 @@ describe("钩子端到端", () => {
     }
     const out = onProvider(body, mkCtx("xingchi", opts, "responses"))
     assert.ok(out)
-    assert.equal(out.prompt_cache_key, undefined) // 旧会话标识已删除
+    // 旧会话标识被替换成轮换值（uuid 形态），不再包含 Codex 原值
+    assert.ok(out.prompt_cache_key !== "sess_0123456789abcdef")
+    assert.match(out.prompt_cache_key, /^[0-9a-f-]{36}$/)
+    // 与标记里的会话 id 一致
+    assert.equal(out.prompt_cache_key, out.instructions.match(/\[magpie-session:([^\]]+)\]/)[1])
     assert.equal(out.model, "gpt-5.2") // 业务字段原样
     assert.equal(out.stream, true)
     assert.deepEqual(out.tools, [{ type: "function", name: "shell" }])
     assert.equal(out.store, false)
-    // mark=both：instructions 前置了会话标记（原有内容保留在后）
     assert.ok(String(out.instructions).endsWith("You are Codex."))
-    assert.ok(String(out.instructions).startsWith("[magpie-session:"))
     assert.ok(String(out.input[0].content[0].text).startsWith("[magpie-session:"))
   })
 
-  test("协议无关剥离：chat 协议带 prompt_cache_key 也删除", () => {
+  test("轮换时 prompt_cache_key 跟着换：撞墙后字段值变化", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const mk = () => ({
+      model: "m",
+      prompt_cache_key: "seed",
+      input: [{ role: "user", content: [{ type: "input_text", text: "same-conv" }] }],
+    })
+    const ctx1 = mkCtx("xingchi", opts, "responses")
+    const out1 = onProvider(mk(), ctx1)
+    const key1 = out1.prompt_cache_key
+    // 撞墙 → 轮换
+    onEvent({ error: { code: "session_request_limit_exceeded" } }, ctx1)
+    const out2 = onProvider(mk(), mkCtx("xingchi", opts, "responses"))
+    assert.notEqual(out2.prompt_cache_key, key1) // 字段值已换新
+  })
+
+  test("sessionFields: strip 删除字段（v0.2.0 行为），off 不动", () => {
+    reset()
+    const stripOpts = { providers: { xingchi: { sessionFields: "strip" } } }
+    const body1 = { model: "m", prompt_cache_key: "old", input: "hi" }
+    const out1 = onProvider(body1, mkCtx("xingchi", stripOpts, "responses"))
+    assert.equal(out1.prompt_cache_key, undefined)
+    const offOpts = { providers: { xingchi: { sessionFields: "off" } } }
+    const body2 = { model: "m", prompt_cache_key: "keep", input: "hi" }
+    const out2 = onProvider(body2, mkCtx("xingchi", offOpts, "responses"))
+    assert.equal(out2.prompt_cache_key, "keep") // 原值不动
+  })
+
+  test("协议无关改写：chat 协议带 prompt_cache_key 也换成轮换值", () => {
     reset()
     const opts = { providers: { xingchi: true } }
     const body = { model: "m", messages: [{ role: "user", content: "hi" }], prompt_cache_key: "old1" }
     const out = onProvider(body, mkCtx("xingchi", opts, "chat"))
     assert.ok(out)
-    assert.equal(out.prompt_cache_key, undefined) // 不依赖 protocol 值
+    assert.notEqual(out.prompt_cache_key, "old1") // 不依赖 protocol 值
+    assert.match(out.prompt_cache_key, /^[0-9a-f-]{36}$/)
   })
 
-  test("session_id 字段也剥离，可用 stripSessionId: false 关闭", () => {
+  test("session_id 字段也改写为轮换值（strip 模式删除）", () => {
     reset()
     const opts = { providers: { xingchi: true } }
     const body = { model: "m", messages: [{ role: "user", content: "hi" }], session_id: "sess-old1" }
     const out = onProvider(body, mkCtx("xingchi", opts, "chat"))
-    assert.equal(out.session_id, undefined)
-    // 关闭后保留
-    const opts2 = { providers: { xingchi: { stripSessionId: false } } }
+    assert.notEqual(out.session_id, "sess-old1")
+    assert.match(out.session_id, /^[0-9a-f-]{36}$/)
+    // strip 模式下删除
+    const opts2 = { providers: { xingchi: { sessionFields: "strip" } } }
     const body2 = { model: "m", messages: [{ role: "user", content: "hi2" }], session_id: "sess-keep" }
     const out2 = onProvider(body2, mkCtx("xingchi", opts2, "chat"))
-    assert.equal(out2.session_id, "sess-keep")
+    assert.equal(out2.session_id, undefined)
   })
 
   test("Responses API：未启用供应商时 prompt_cache_key 原样保留", () => {
@@ -343,13 +376,13 @@ describe("钩子端到端", () => {
     assert.equal(body.prompt_cache_key, "keep-me") // 未启用：请求体未被修改
   })
 
-  test("Responses API：仅剥离模式（mark=none 且 maxRequests=0）也删 cache key", () => {
+  test("Responses API：仅剥离模式（mark=none 且 maxRequests=0）也改写 cache key", () => {
     reset()
     const opts = { providers: { xingchi: { mark: "none", maxRequests: 0 } } }
     const body = { model: "m", input: "hi", prompt_cache_key: "old-session" }
     const out = onProvider(body, mkCtx("xingchi", opts, "responses"))
-    assert.ok(out) // 剥离后返回修改过的 body
-    assert.equal(out.prompt_cache_key, undefined)
+    assert.ok(out) // 改写后返回修改过的 body
+    assert.notEqual(out.prompt_cache_key, "old-session")
     assert.equal(JSON.stringify(out).includes("magpie-session"), false) // 不注入任何标记
   })
 
