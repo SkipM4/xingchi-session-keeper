@@ -1,9 +1,13 @@
 // xingchi-session-keeper.middleware.mjs — magpie 网关中间件
 //
 // 作用：挂在「你已经在用的供应商」上（在插件选项里按供应商 id 启用，如 xingchi）。
-// 当中转站按会话限制请求次数（如 XingChi 每会话 100 次，超限返回
-// session_request_limit_exceeded）时，本中间件自动轮换会话标识：
+// 上游现在按「会话内模型回复轮数」限制（如 XingChi 每会话 100 轮，超限返回
+// 「当前会话模型已回复 N 轮，达到上限，请 /compact 或 /new」）。光换会话 id
+// 不够——Codex 每轮都带全量历史。本中间件因此：
 //
+//   0. 轮次压缩（核心）：请求体模型回复轮数超过 maxTurns 时，丢弃最旧轮次、
+//      保留 system/instructions 与最近轮次，并强制换新会话标识。这样正常请求
+//      与 magpie 的 remote compact 请求都不再撞上游上限；
 //   1. 主动轮换：同一对话发到 maxRequests 次之前就换新会话标识；
 //   2. 被动自愈：检测到回复里的会话上限错误后立即换新会话标识——
 //      magpie 的故障切换重试同一供应商时自动进入全新会话；
@@ -21,6 +25,7 @@
 // 配置（magpie plugin options xingchi-session-keeper '<json>'）：
 // {
 //   "providers": { "xingchi": true, "my-relay": { "maxRequests": 40 } },
+//   "maxTurns": 80,        // 轮次压缩阈值（上游每会话 100 轮就填 80–90；0 = 关闭）
 //   "maxRequests": 80,     // 主动轮换阈值（默认 80，留出安全余量）
 //   "mark": "both",        // 标记位置：none / system / first-user / both
 //   "coolDownMs": 60000,   // 撞墙标记的有效期
@@ -33,6 +38,7 @@
 
 const DEFAULTS = {
   maxRequests: 80,
+  maxTurns: 80,
   mark: "both",
   coolDownMs: 60000,
 }
@@ -43,10 +49,14 @@ const DEFAULT_CODES = [
   "session_request_limit",
   "conversation_request_limit_exceeded",
   "conversation_limit_exceeded",
+  "session_turn_limit_exceeded",
+  "conversation_turn_limit_exceeded",
+  "turn_limit_exceeded",
+  "max_turns_exceeded",
 ]
 
 const DEFAULT_TEXT =
-  "session_request_limit|已达到.{0,32}请求上限|会话.{0,16}(上限|已达到)|start a new session|新开一个会话|请新开|new session to continue|session has reached"
+  "session_request_limit|已达到.{0,32}请求上限|会话.{0,16}(上限|已达到)|start a new session|新开一个会话|请新开|new session to continue|session has reached|达到上限|回复.{0,10}轮|轮次上限|model turns|reached.{0,24}turns|请新建对话|run /compact"
 
 const MARK_RE = /\[magpie-session:[0-9A-Za-z_-]{1,64}\]/g
 
@@ -78,6 +88,7 @@ function readOptions(raw) {
   const o = raw && typeof raw === "object" ? raw : {}
   const out = {}
   out.maxRequests = toInt(o.maxRequests, DEFAULTS.maxRequests, 0, 1000000)
+  out.maxTurns = toInt(o.maxTurns, DEFAULTS.maxTurns, 0, 1000000)
   out.coolDownMs = toInt(o.coolDownMs, DEFAULTS.coolDownMs, 1000, 3600000)
   out.mark = ["none", "system", "first-user", "both"].indexOf(o.mark) >= 0 ? o.mark : DEFAULTS.mark
   const codes = {}
@@ -118,6 +129,7 @@ function providerConfig(opts, providerId) {
       : "replace"
   return {
     maxRequests: toInt(per.maxRequests, opts.maxRequests, 0, 1000000),
+    maxTurns: toInt(per.maxTurns, opts.maxTurns, 0, 1000000),
     mark: ["none", "system", "first-user", "both"].indexOf(per.mark) >= 0 ? per.mark : opts.mark,
     coolDownMs: toInt(per.coolDownMs, opts.coolDownMs, 1000, 3600000),
     matchCodes: opts.matchCodes,
@@ -410,6 +422,90 @@ function existingMarkSid(body, kind) {
   return scan(firstUserText(body, kind))
 }
 
+// ---------- 轮次压缩（应对上游「每会话最多 N 轮」策略） ----------
+
+// 取请求体里的对话消息列表
+function convList(body, kind) {
+  if (!body || typeof body !== "object") return null
+  if (kind === "responses") return Array.isArray(body.input) ? body.input : null
+  if (kind === "gemini") return Array.isArray(body.contents) ? body.contents : null
+  return Array.isArray(body.messages) ? body.messages : null
+}
+
+function setConvList(body, kind, list) {
+  if (kind === "responses") body.input = list
+  else if (kind === "gemini") body.contents = list
+  else body.messages = list
+}
+
+// 是否「模型回复」——计入上游的轮次
+function isModelReply(m, kind) {
+  if (!m || typeof m !== "object") return false
+  if (kind === "gemini") return m.role === "model"
+  if (kind === "responses") return m.type === "function_call" || m.role === "assistant"
+  return m.role === "assistant"
+}
+
+function countModelReplies(list, kind) {
+  let c = 0
+  for (const m of list) if (isModelReply(m, kind)) c++
+  return c
+}
+
+// 是否「一轮对话的起点」（真正的用户发言；工具结果不算）
+function isTurnStart(m, kind) {
+  if (!m || typeof m !== "object") return false
+  if (kind === "anthropic") {
+    if (m.role !== "user") return false
+    if (Array.isArray(m.content)) {
+      for (const b of m.content) if (!b || typeof b !== "object" || b.type !== "tool_result") return true
+      return false
+    }
+    return true
+  }
+  return m.role === "user"
+}
+
+function isSystemLike(m) {
+  if (!m || typeof m !== "object") return false
+  return m.role === "system" || m.role === "developer"
+}
+
+// 轮次压缩：请求体模型回复轮数超过 maxTurns 时，只保留最近的若干轮对话，
+// 使上游按「每会话最多 N 轮」计数时不再撞墙。返回 null（未压缩）或 { dropped, kept }。
+function trimTurns(body, kind, maxTurns) {
+  if (!(maxTurns > 0)) return null
+  const list = convList(body, kind)
+  if (!Array.isArray(list) || list.length === 0) return null
+  const total = countModelReplies(list, kind)
+  if (total <= maxTurns) return null
+
+  // 保留列表开头的 system/developer（不占轮次，丢了会丢人设/指令）
+  let headEnd = 0
+  while (headEnd < list.length && isSystemLike(list[headEnd])) headEnd++
+  const head = list.slice(0, headEnd)
+  const rest = list.slice(headEnd)
+
+  // 候选切点：每轮用户发言的起点（不在工具结果上切断，避免孤立工具调用）
+  const starts = []
+  for (let i = 0; i < rest.length; i++) if (isTurnStart(rest[i], kind)) starts.push(i)
+
+  let cut = -1
+  for (const s of starts) {
+    let c = 0
+    for (let i = s; i < rest.length; i++) if (isModelReply(rest[i], kind)) c++
+    if (c <= maxTurns) {
+      cut = s
+      break
+    }
+  }
+  if (cut < 0) cut = starts.length ? starts[starts.length - 1] : Math.max(0, rest.length - 1)
+
+  const kept = head.concat(rest.slice(cut))
+  setConvList(body, kind, kept)
+  return { dropped: total - countModelReplies(kept, kind), kept: kept.length }
+}
+
 // ---------- 错误识别 ----------
 
 // 判断一个回复对象（事件 data JSON 或非流式回复体）是否是会话上限错误
@@ -506,6 +602,26 @@ export function onProvider(body, ctx) {
       st.count = 1
       st.mark = "both"
       rotated = true
+    }
+
+    // 轮次压缩：请求体里的模型回复轮数超过 maxTurns 时，丢掉最旧的轮次、只留最近的。
+    // 上游按「每会话最多 N 轮」计上限，光换会话 id 没用（Codex 每轮都带全量历史）——
+    // 必须真正缩短对话内容。压缩同时换新会话标识：按会话累计轮数的中转站也会因此重置计数。
+    const trimmed = trimTurns(body, kind, cfg.maxTurns)
+    if (trimmed) {
+      st.sid = uuid()
+      st.count = 1
+      st.mark = "both"
+      rotated = true
+      console.log(
+        "session-keeper: " +
+          String(ctx.provider.id) +
+          " 已压缩会话上下文（丢弃 " +
+          trimmed.dropped +
+          " 轮旧对话，保留 " +
+          trimmed.kept +
+          " 条消息）并换新会话",
+      )
     }
 
     const marker = "[magpie-session:" + st.sid + "]"
@@ -640,6 +756,10 @@ export const _internal = {
   existingMarkSid,
   isLimitError,
   hasErrorField,
+  trimTurns,
+  isModelReply,
+  isTurnStart,
+  countModelReplies,
   state,
   onProvider,
   onEvent,

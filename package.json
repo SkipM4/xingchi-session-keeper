@@ -1,7 +1,7 @@
 {
   "name": "xingchi-session-keeper",
-  "version": "0.3.0",
-  "description": "magpie gateway middleware: automatically rotate sessions when XingChi (or any provider) hits its per-session request limit",
+  "version": "0.4.0",
+  "description": "magpie gateway middleware: auto-compress conversation turns and rotate sessions when a provider hits its per-session turn/request limit",
   "type": "module",
   "keywords": ["magpie", "middleware", "xingchi", "session", "relay"],
   "license": "MIT",
@@ -9,14 +9,15 @@
     "middleware": "./xingchi-session-keeper.middleware.mjs",
     "name": "XingChi Session Keeper",
     "summary": {
-      "en": "Automatically start a new session when a provider hits its per-session request limit. Works on top of providers you already use; no separate sign-in.",
-      "zh": "供应商命中会话请求上限（如 XingChi 每会话 100 次）时自动换会话继续，挂在你已有的供应商上用，无需额外登录。"
+      "en": "Auto-compress old conversation turns and rotate the session when a provider caps turns/requests per session (e.g. XingChi 100 turns). Works on top of providers you already use; no separate sign-in.",
+      "zh": "供应商按会话限制轮次/请求数（如 XingChi 每会话 100 轮）时自动压缩旧对话并换会话继续，挂在你已有的供应商上用，无需额外登录。"
     },
     "options": {
       "providers": {
         "xingchi": {}
       },
       "maxRequests": 80,
+      "maxTurns": 80,
       "mark": "both"
     }
   }

@@ -19,6 +19,7 @@ const {
   existingMarkSid,
   isLimitError,
   hasErrorField,
+  trimTurns,
   state,
   reset,
 } = _internal
@@ -392,5 +393,135 @@ describe("钩子端到端", () => {
     assert.equal(onProvider({ messages: null }, null), undefined)
     assert.equal(onEvent(null, null), undefined)
     assert.equal(onResponse(null, null), undefined)
+  })
+})
+
+describe("轮次压缩（每会话最多 N 轮）", () => {
+  test("chat：超过 maxTurns 只保留最近轮次，保留 system", () => {
+    const msgs = [{ role: "system", content: "sys" }]
+    for (let i = 0; i < 10; i++) {
+      msgs.push({ role: "user", content: "u" + i })
+      msgs.push({ role: "assistant", content: "a" + i })
+    }
+    const body = { model: "m", messages: msgs }
+    const r = trimTurns(body, "chat", 3)
+    assert.ok(r)
+    const replies = body.messages.filter((m) => m.role === "assistant").length
+    assert.ok(replies <= 3)
+    assert.equal(body.messages[0].role, "system") // system 保留
+    assert.equal(body.messages[1].role, "user") // 以用户轮开头
+    assert.equal(body.messages[body.messages.length - 1].content, "a9") // 最新一轮还在
+    assert.ok(r.dropped >= 7)
+  })
+
+  test("chat：未超阈值不动", () => {
+    const body = { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] }
+    assert.equal(trimTurns(body, "chat", 5), null)
+  })
+
+  test("anthropic：不把 tool_result 当轮起点", () => {
+    const body = {
+      messages: [
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+        { role: "assistant", content: "a1" },
+        { role: "user", content: "next" },
+        { role: "assistant", content: "a2" },
+      ],
+    }
+    const r = trimTurns(body, "anthropic", 1)
+    assert.ok(r)
+    assert.equal(body.messages[0].content, "next")
+    assert.equal(body.messages[1].content, "a2")
+  })
+
+  test("responses：function_call 计入轮次，instructions 不受影响", () => {
+    const body = {
+      instructions: "sys",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "q0" }] },
+        { type: "function_call", name: "shell", arguments: "{}", call_id: "c0" },
+        { type: "function_call_output", call_id: "c0", output: "ok" },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "q1" }] },
+        { type: "function_call", name: "shell", arguments: "{}", call_id: "c1" },
+      ],
+    }
+    const r = trimTurns(body, "responses", 1)
+    assert.ok(r)
+    assert.equal(body.instructions, "sys")
+    assert.equal(body.input[0].content[0].text, "q1")
+    assert.equal(body.input[1].type, "function_call")
+  })
+
+  test("gemini：role=model 计轮次", () => {
+    const body = {
+      contents: [
+        { role: "user", parts: [{ text: "u0" }] },
+        { role: "model", parts: [{ text: "m0" }] },
+        { role: "user", parts: [{ text: "u1" }] },
+        { role: "model", parts: [{ text: "m1" }] },
+      ],
+    }
+    const r = trimTurns(body, "gemini", 1)
+    assert.ok(r)
+    assert.equal(body.contents[0].parts[0].text, "u1")
+    assert.equal(body.contents.length, 2)
+  })
+
+  test("钩子：超轮次自动压缩并换会话", () => {
+    reset()
+    const opts = { providers: { xingchi: true }, maxTurns: 2 }
+    const msgs = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "first" },
+      { role: "assistant", content: "a0" },
+      { role: "user", content: "u0" },
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "u1" },
+      { role: "assistant", content: "a2" },
+      { role: "user", content: "u2" },
+      { role: "assistant", content: "a3" },
+      { role: "assistant", content: "a4" },
+    ]
+    const out = onProvider({ model: "m", messages: msgs }, mkCtx("xingchi", opts))
+    assert.ok(out)
+    const replies = out.messages.filter((m) => m.role === "assistant").length
+    assert.ok(replies <= 2)
+    const st = [...state.values()][0]
+    assert.equal(st.count, 1) // 压缩后计为新会话
+  })
+
+  test("已撞墙的真实场景：Codex 带 105 轮历史 + 旧会话 id，一次请求即降到上限内", () => {
+    reset()
+    const opts = { providers: { xingchi: true } } // 全部默认（maxTurns=80）
+    const input = []
+    for (let i = 0; i < 105; i++) {
+      input.push({ type: "message", role: "user", content: [{ type: "input_text", text: "q" + i }] })
+      input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "a" + i }] })
+    }
+    const body = {
+      model: "gpt-6.1-sol",
+      stream: true,
+      prompt_cache_key: "sess_deadbeefdeadbeef",
+      instructions: "You are Codex.",
+      input,
+      tools: [{ type: "function", name: "shell" }],
+      store: false,
+    }
+    const out = onProvider(body, mkCtx("xingchi", opts, "responses"))
+    assert.ok(out)
+    const replies = out.input.filter((m) => m.role === "assistant" || m.type === "function_call").length
+    assert.ok(replies <= 80, "压缩后轮数必须 <= maxTurns，实际 " + replies)
+    assert.notEqual(out.prompt_cache_key, "sess_deadbeefdeadbeef") // 会话 id 已换
+    assert.equal(out.instructions.indexOf("You are Codex.") >= 0, true) // 指令保留
+    assert.deepEqual(out.tools, [{ type: "function", name: "shell" }])
+  })
+
+  test("maxTurns=0 关闭压缩", () => {
+    const body = { messages: [] }
+    for (let i = 0; i < 10; i++) {
+      body.messages.push({ role: "assistant", content: "a" + i })
+      body.messages.push({ role: "user", content: "u" + i })
+    }
+    assert.equal(trimTurns(body, "chat", 0), null)
   })
 })
