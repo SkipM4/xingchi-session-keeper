@@ -1,6 +1,6 @@
 {
   "name": "xingchi-session-keeper",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "magpie gateway middleware: auto-compress conversation turns and rotate sessions when a provider hits its per-session turn/request limit",
   "type": "module",
   "keywords": ["magpie", "middleware", "xingchi", "session", "relay"],
@@ -17,7 +17,7 @@
         "xingchi": {}
       },
       "maxRequests": 80,
-      "maxTurns": 80,
+      "maxTurns": 65,
       "mark": "both"
     }
   }

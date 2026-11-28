@@ -20,6 +20,8 @@ const {
   isLimitError,
   hasErrorField,
   trimTurns,
+  isCompactRequest,
+  effectiveLimit,
   state,
   reset,
 } = _internal
@@ -46,6 +48,7 @@ describe("选项解析", () => {
   test("readOptions 默认值（含未配置时默认启用 xingchi）", () => {
     const o = readOptions(undefined)
     assert.equal(o.maxRequests, 80)
+    assert.equal(o.maxTurns, 65) // 默认目标留在上游 100 轮硬上限之下
     assert.equal(o.mark, "both")
     assert.equal(o.coolDownMs, 60000)
     assert.ok(o.matchCodes["session_request_limit_exceeded"])
@@ -490,30 +493,115 @@ describe("轮次压缩（每会话最多 N 轮）", () => {
     assert.equal(st.count, 1) // 压缩后计为新会话
   })
 
-  test("已撞墙的真实场景：Codex 带 105 轮历史 + 旧会话 id，一次请求即降到上限内", () => {
-    reset()
-    const opts = { providers: { xingchi: true } } // 全部默认（maxTurns=80）
+  // 上游实际报错：105 轮 + 400 session_turn_limit_exceeded。这正是用户碰到的形状。
+  function mkOverflowBody(turns, instructions = "You are Codex.") {
     const input = []
-    for (let i = 0; i < 105; i++) {
+    for (let i = 0; i < turns; i++) {
       input.push({ type: "message", role: "user", content: [{ type: "input_text", text: "q" + i }] })
-      input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "a" + i }] })
+      input.push({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "a" + i }],
+      })
+      // 真实 Codex 历史里还有 reasoning 与 tool 往返，这里各掺一些，验证不误切
+      if (i % 7 === 0) input.push({ type: "reasoning", summary: [], encrypted_content: "eyJ" })
+      if (i % 5 === 0) {
+        input.push({ type: "function_call", name: "shell", arguments: "{}", call_id: "c" + i })
+        input.push({ type: "function_call_output", call_id: "c" + i, output: "ok" })
+      }
     }
-    const body = {
+    return {
       model: "gpt-6.1-sol",
       stream: true,
       prompt_cache_key: "sess_deadbeefdeadbeef",
-      instructions: "You are Codex.",
+      instructions,
       input,
       tools: [{ type: "function", name: "shell" }],
       store: false,
     }
+  }
+
+  const repliesOf = (b) => b.input.filter((m) => m.role === "assistant" || m.type === "function_call").length
+
+  test("已撞墙的真实场景：105 轮一次请求即压到硬上限 60%，指令/工具原样", () => {
+    reset()
+    const opts = { providers: { xingchi: true } } // 全默认
+    const body = mkOverflowBody(105)
     const out = onProvider(body, mkCtx("xingchi", opts, "responses"))
     assert.ok(out)
-    const replies = out.input.filter((m) => m.role === "assistant" || m.type === "function_call").length
-    assert.ok(replies <= 80, "压缩后轮数必须 <= maxTurns，实际 " + replies)
+    const replies = repliesOf(out)
+    assert.ok(replies <= 60, "已到硬上限必须深压（≤60），实际 " + replies)
     assert.notEqual(out.prompt_cache_key, "sess_deadbeefdeadbeef") // 会话 id 已换
-    assert.equal(out.instructions.indexOf("You are Codex.") >= 0, true) // 指令保留
+    assert.ok(out.instructions.includes("You are Codex.")) // 指令保留
     assert.deepEqual(out.tools, [{ type: "function", name: "shell" }])
+    // 首个非 system 条目是真实用户发言，不是孤立的 function_call_output
+    const first = out.input.find((m) => m.role !== "system" && m.role !== "developer")
+    assert.equal(first.role, "user")
+    // 每个 function_call 都有 output 或不被孤立：末尾也不能是 output
+    assert.notEqual(out.input[out.input.length - 1].type, "function_call_output")
+  })
+
+  test("remote compact 请求：压得更狠（≤50 轮），保证摘要请求本身能过", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const body = mkOverflowBody(
+      105,
+      "You are a helpful assistant tasked with summarizing a conversation. Create a detailed summary of the conversation so far.",
+    )
+    assert.equal(isCompactRequest(body, "responses"), true)
+    const out = onProvider(body, mkCtx("xingchi", opts, "responses"))
+    assert.ok(repliesOf(out) <= 50, "compact 请求必须压到 ≤50，实际 " + repliesOf(out))
+    assert.ok(out.instructions.includes("summarizing a conversation")) // 摘要指令保留
+  })
+
+  test("撞墙学习：撞一次后目标减半，后续请求压得更紧", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    // 先跑一个远低于上限的对话，不触发压缩
+    const ctx1 = mkCtx("xingchi", opts, "responses")
+    onProvider(mkOverflowBody(95), ctx1)
+    const st = [...state.values()][0]
+    const before = st.softTurns || 0
+    // 上游仍报错
+    onResponse(
+      {
+        error: {
+          code: "session_turn_limit_exceeded",
+          message: "当前会话模型已回复 105 轮，达到上限。",
+        },
+      },
+      { ...ctx1, status: 400 },
+    )
+    assert.ok(st.limitedAt > 0) // 已标记撞墙
+    // 下一次请求：学习收紧目标，并当场按新目标压缩
+    const out = onProvider(mkOverflowBody(105), mkCtx("xingchi", opts, "responses"))
+    assert.ok(st.softTurns > 0, "撞墙后必须学到 softTurns")
+    if (before) assert.ok(st.softTurns <= before)
+    assert.ok(repliesOf(out) <= st.softTurns, "必须按学到的目标压，实际 " + repliesOf(out))
+    assert.ok(repliesOf(out) < 60, "学到的目标要严于硬上限深压值")
+  })
+
+  test("有效目标：未到硬上限时用 maxTurns，到了就压到 60", () => {
+    const cfg = { maxTurns: 65 }
+    assert.equal(effectiveLimit(cfg, null, 70), 65) // 70 < 100，仍用 maxTurns
+    assert.equal(effectiveLimit(cfg, null, 100), 60) // 到硬上限 → 60
+    assert.equal(effectiveLimit(cfg, { softTurns: 20 }, 105), 20) // 学到的值优先
+  })
+
+  test("压缩不塌成一轮：尽量保留到目标上限，而非只留最后一轮", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const out = onProvider(mkOverflowBody(150), mkCtx("xingchi", opts, "responses"))
+    assert.ok(repliesOf(out) >= 40, "应尽量保留到接近目标，实际只有 " + repliesOf(out))
+    assert.ok(repliesOf(out) <= 60)
+  })
+
+  test("压缩后不减掉未超阈值的对话内容（66 轮只压必要的 1 轮）", () => {
+    reset()
+    const opts = { providers: { xingchi: true } }
+    const out = onProvider(mkOverflowBody(66), mkCtx("xingchi", opts, "responses"))
+    assert.ok(repliesOf(out) <= 65)
+    assert.ok(repliesOf(out) >= 55, "只超 1 轮应基本全保留，实际 " + repliesOf(out))
   })
 
   test("maxTurns=0 关闭压缩", () => {

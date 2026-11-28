@@ -5,9 +5,11 @@
 // 「当前会话模型已回复 N 轮，达到上限，请 /compact 或 /new」）。光换会话 id
 // 不够——Codex 每轮都带全量历史。本中间件因此：
 //
-//   0. 轮次压缩（核心）：请求体模型回复轮数超过 maxTurns 时，丢弃最旧轮次、
-//      保留 system/instructions 与最近轮次，并强制换新会话标识。这样正常请求
-//      与 magpie 的 remote compact 请求都不再撞上游上限；
+//   0. 轮次压缩（核心）：请求体轮数超过目标时，丢弃最旧轮次、保留
+//      system/instructions 与最近轮次，并强制换新会话标识。目标始终留在
+//      上游 100 轮硬上限之下：常规 maxTurns(65)；已达 100 轮则深压到 60；
+//      remote compact 请求压到 50；撞过墙的对话再减半收紧。这样正常请求
+//      与 magpie 反复重试的 remote compact 请求都不会撞上游上限；
 //   1. 主动轮换：同一对话发到 maxRequests 次之前就换新会话标识；
 //   2. 被动自愈：检测到回复里的会话上限错误后立即换新会话标识——
 //      magpie 的故障切换重试同一供应商时自动进入全新会话；
@@ -38,10 +40,16 @@
 
 const DEFAULTS = {
   maxRequests: 80,
-  maxTurns: 80,
+  maxTurns: 65,
   mark: "both",
   coolDownMs: 60000,
 }
+
+// 上游上限（XingChi 每会话 100 轮）。压缩目标永远留在它下面——
+// 上游的实际计数与我们的统计可能不一致（reasoning/tool 条目等），必须留余量。
+const HARD_TURN_CAP = 100
+// 撞墙后逐次减半的下限，避免压成空对话
+const MIN_TURNS = 8
 
 const DEFAULT_CODES = [
   "session_request_limit_exceeded",
@@ -452,6 +460,15 @@ function countModelReplies(list, kind) {
   return c
 }
 
+// 上游数的是「模型回复轮数」，一轮 = 一条用户发言及其后续全部回复/工具往返。
+// 因此按用户轮起点计数，比只数 assistant 保守（reasoning、function_call 都算在轮内）——
+// 我们的计数只会高估、不会低估，压缩后必然低于上游计数。
+function countTurns(list, kind) {
+  let c = 0
+  for (const m of list) if (isTurnStart(m, kind)) c++
+  return c
+}
+
 // 是否「一轮对话的起点」（真正的用户发言；工具结果不算）
 function isTurnStart(m, kind) {
   if (!m || typeof m !== "object") return false
@@ -471,14 +488,48 @@ function isSystemLike(m) {
   return m.role === "system" || m.role === "developer"
 }
 
+// 有效压缩目标：请求体轮数已到上游硬上限时强制深压（60%），
+// 并把撞墙后学到的 softTurns 作为更紧的上界。
+function effectiveLimit(cfg, st, total) {
+  let lim = cfg.maxTurns
+  if (total >= HARD_TURN_CAP) lim = Math.min(lim, Math.floor(HARD_TURN_CAP * 0.6))
+  if (st && st.softTurns) lim = Math.min(lim, st.softTurns)
+  return lim
+}
+
+// 是否是 magpie 的 remote compact 请求：摘要指令在 system/instructions 里。
+// 压缩请求自带全量历史，是撞墙的主要来源，给它更狠的目标。
+const COMPACT_RE = /summar|摘要|压缩上下文|compact/i
+
+function isCompactRequest(body, kind) {
+  const cands = [
+    body && typeof body.instructions === "string" ? body.instructions : null,
+    body && typeof body.system === "string" ? body.system : null,
+    body && Array.isArray(body.system) && body.system[0] && typeof body.system[0].text === "string"
+      ? body.system[0].text
+      : null,
+  ]
+  const list = convList(body, kind)
+  if (Array.isArray(list)) {
+    for (const m of list) {
+      if (!m || !isSystemLike(m)) continue
+      cands.push(typeof m.content === "string" ? m.content : null)
+    }
+  }
+  for (const c of cands) if (c && COMPACT_RE.test(c)) return true
+  return false
+}
+
 // 轮次压缩：请求体模型回复轮数超过 maxTurns 时，只保留最近的若干轮对话，
 // 使上游按「每会话最多 N 轮」计数时不再撞墙。返回 null（未压缩）或 { dropped, kept }。
 function trimTurns(body, kind, maxTurns) {
   if (!(maxTurns > 0)) return null
   const list = convList(body, kind)
   if (!Array.isArray(list) || list.length === 0) return null
-  const total = countModelReplies(list, kind)
-  if (total <= maxTurns) return null
+  // 触发判据用「轮数」（只高估，宁可多压一次）
+  const total = countTurns(list, kind)
+  const totalReplies = countModelReplies(list, kind)
+  if (total <= maxTurns && totalReplies <= maxTurns) return null
 
   // 保留列表开头的 system/developer（不占轮次，丢了会丢人设/指令）
   let headEnd = 0
@@ -486,24 +537,23 @@ function trimTurns(body, kind, maxTurns) {
   const head = list.slice(0, headEnd)
   const rest = list.slice(headEnd)
 
-  // 候选切点：每轮用户发言的起点（不在工具结果上切断，避免孤立工具调用）
+  // 切点只落在一轮的起点（真实用户发言），不切开工具调用/结果；
+  // 目标按「模型回复条数」算（≥ 轮数），保证 assistant + function_call 总量也超不过上限。
   const starts = []
   for (let i = 0; i < rest.length; i++) if (isTurnStart(rest[i], kind)) starts.push(i)
-
-  let cut = -1
-  for (const s of starts) {
-    let c = 0
-    for (let i = s; i < rest.length; i++) if (isModelReply(rest[i], kind)) c++
-    if (c <= maxTurns) {
+  // 从最早的起点往后找第一个满足目标的切点（越早保留越多内容）
+  let cut = starts.length ? starts[starts.length - 1] : 0
+  for (let k = 0; k < starts.length; k++) {
+    const s = starts[k]
+    if (countModelReplies(rest.slice(s), kind) <= maxTurns) {
       cut = s
       break
     }
   }
-  if (cut < 0) cut = starts.length ? starts[starts.length - 1] : Math.max(0, rest.length - 1)
 
   const kept = head.concat(rest.slice(cut))
   setConvList(body, kind, kept)
-  return { dropped: total - countModelReplies(kept, kind), kept: kept.length }
+  return { dropped: total - countTurns(kept, kind), kept: kept.length }
 }
 
 // ---------- 错误识别 ----------
@@ -593,6 +643,12 @@ export function onProvider(body, ctx) {
       st.mark = "both" // 升级到最强标记，确保中转站认成新会话
       st.limitedAt = 0
       rotated = true
+      // 撞过一次墙说明当前目标不可信：把目标减半，后续请求压得更紧（夹在 MIN_TURNS 之上）
+      const total = countTurns(convList(body, kind) || [], kind)
+      if (total > 0) {
+        const learned = Math.max(MIN_TURNS, Math.floor(effectiveLimit(cfg, st, total) / 2))
+        if (!st.softTurns || learned < st.softTurns) st.softTurns = learned
+      }
     } else if (st.limitedAt) {
       st.limitedAt = 0
     }
@@ -604,10 +660,18 @@ export function onProvider(body, ctx) {
       rotated = true
     }
 
-    // 轮次压缩：请求体里的模型回复轮数超过 maxTurns 时，丢掉最旧的轮次、只留最近的。
+    // 轮次压缩：请求体里的模型回复轮数超过目标时，丢掉最旧的轮次、只留最近的。
     // 上游按「每会话最多 N 轮」计上限，光换会话 id 没用（Codex 每轮都带全量历史）——
     // 必须真正缩短对话内容。压缩同时换新会话标识：按会话累计轮数的中转站也会因此重置计数。
-    const trimmed = trimTurns(body, kind, cfg.maxTurns)
+    //
+    // 目标不是常数：已到上游硬上限（105 轮这类）就深压到 60%，
+    // remote compact 请求压得更狠（它是全量历史 + 摘要指令，撞墙主要来源），
+    // 撞过墙的对话按学到的 softTurns 一直压紧。总之永远留在 100 轮以内。
+    const rawReplies = countTurns(convList(body, kind) || [], kind)
+    let limit = effectiveLimit(cfg, st, rawReplies)
+    const compact = isCompactRequest(body, kind)
+    if (compact) limit = Math.min(limit, Math.floor(HARD_TURN_CAP * 0.5))
+    const trimmed = trimTurns(body, kind, limit)
     if (trimmed) {
       st.sid = uuid()
       st.count = 1
@@ -620,7 +684,10 @@ export function onProvider(body, ctx) {
           trimmed.dropped +
           " 轮旧对话，保留 " +
           trimmed.kept +
-          " 条消息）并换新会话",
+          " 条消息，目标 ≤" +
+          limit +
+          (compact ? "，remote compact" : "") +
+          "）并换新会话",
       )
     }
 
@@ -760,6 +827,10 @@ export const _internal = {
   isModelReply,
   isTurnStart,
   countModelReplies,
+  countTurns,
+  isCompactRequest,
+  effectiveLimit,
+  HARD_TURN_CAP,
   state,
   onProvider,
   onEvent,
